@@ -1,10 +1,11 @@
 """Database & Google Sheets Persistence Layer for SEO Super Star.
 
 Supports:
-1. Neon Serverless Postgres (`postgresql://...`) via SQLAlchemy (`pool_pre_ping=True`)
-   or `psycopg2` so scale-to-zero instances wake up transparently.
-2. Built-in Python `sqlite3` fallback (`seo_super_star.db`) requiring zero external
-   database packages for immediate local execution.
+1. Neon Serverless Postgres (`postgresql://...`) via SQLAlchemy 2.0 `text()` execution
+   (`pool_pre_ping=True`) so scale-to-zero instances wake up transparently without
+   `psycopg2` `%` interpolation errors or `ROUND(real, int)` type mismatches.
+2. Automatic seamless fallback to built-in Python `sqlite3` (`seo_super_star.db`) if
+   `DATABASE_URL` is absent or unreachable.
 3. 1-click Google Sheets sync via `gspread`.
 """
 
@@ -13,8 +14,33 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import pandas as pd
 from core.config import Settings, get_settings
+
+
+def _clean_postgres_url(raw_url: str) -> str:
+    """Normalize a Neon/Postgres connection string for SQLAlchemy + psycopg2."""
+    u = raw_url.strip().strip("'").strip('"')
+    if u.startswith("psql "):
+        u = u[5:].strip().strip("'").strip('"')
+    if u.startswith("postgres://"):
+        u = u.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif u.startswith("postgresql://") and "+psycopg2" not in u:
+        u = u.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    try:
+        parsed = urlparse(u)
+        if parsed.query:
+            q_pairs = [
+                (k, v)
+                for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                if k.lower() not in ("channel_binding",)
+            ]
+            u = urlunparse(parsed._replace(query=urlencode(q_pairs)))
+    except Exception:
+        pass
+    return u
 
 
 class StorageManager:
@@ -22,21 +48,21 @@ class StorageManager:
 
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
-        self.db_url = self.settings.database_url
-        self._use_postgres = self.db_url.startswith(("postgres://", "postgresql://", "postgresql+psycopg2://"))
+        self.db_url = (self.settings.database_url or "sqlite:///seo_super_star.db").strip()
+        self._use_postgres = self.db_url.startswith(
+            ("postgres://", "postgresql://", "postgresql+psycopg2://", "psql ")
+        )
         self._sa_engine = None
+        self.last_error: Optional[str] = None
 
         if self._use_postgres:
             try:
                 from sqlalchemy import create_engine
 
-                norm_url = self.db_url
-                if norm_url.startswith("postgres://"):
-                    norm_url = norm_url.replace("postgres://", "postgresql+psycopg2://", 1)
-                elif norm_url.startswith("postgresql://") and "+psycopg2" not in norm_url:
-                    norm_url = norm_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-                self._sa_engine = create_engine(norm_url, pool_pre_ping=True)
-            except Exception:
+                clean_url = _clean_postgres_url(self.db_url)
+                self._sa_engine = create_engine(clean_url, pool_pre_ping=True)
+            except Exception as exc:
+                self.last_error = f"Postgres init fallback to SQLite: {exc}"
                 self._use_postgres = False
 
         self.sqlite_path = self._resolve_sqlite_path(self.db_url)
@@ -110,20 +136,25 @@ class StorageManager:
         ]
 
         if self._use_postgres and self._sa_engine is not None:
-            from sqlalchemy import text
+            try:
+                from sqlalchemy import text
 
-            pg_ddls = [
-                stmt.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-                for stmt in ddl_statements
-            ]
-            with self._sa_engine.begin() as conn:
-                for stmt in pg_ddls:
-                    conn.execute(text(stmt))
-        else:
-            with self._get_sqlite_conn() as conn:
-                for stmt in ddl_statements:
-                    conn.execute(stmt)
-                conn.commit()
+                pg_ddls = [
+                    stmt.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+                    for stmt in ddl_statements
+                ]
+                with self._sa_engine.begin() as conn:
+                    for stmt in pg_ddls:
+                        conn.execute(text(stmt))
+                return
+            except Exception as exc:
+                self.last_error = f"Postgres schema fallback to SQLite: {exc}"
+                self._use_postgres = False
+
+        with self._get_sqlite_conn() as conn:
+            for stmt in ddl_statements:
+                conn.execute(stmt)
+            conn.commit()
 
     def save_audit(
         self,
@@ -162,31 +193,34 @@ class StorageManager:
         )
 
         if self._use_postgres and self._sa_engine is not None:
-            from sqlalchemy import text
+            try:
+                from sqlalchemy import text
 
-            with self._sa_engine.begin() as conn:
-                res = conn.execute(
-                    text(
-                        """
-                        INSERT INTO url_audits (
-                            url, audited_at, status_code, title, title_px, meta_desc, meta_px,
-                            word_count, h1_count, missing_alt_count, internal_links, external_links,
-                            seo_score, performance_score, geo_score, schema_types, generated_jsonld, raw_audit_json
-                        ) VALUES (
-                            :u, :at, :sc, :t, :tpx, :md, :mpx, :wc, :h1, :alt, :il, :el,
-                            :seo, :perf, :geo, :st, :jld, :raw
-                        ) RETURNING id
-                        """
-                    ),
-                    dict(
-                        zip(
-                            ["u", "at", "sc", "t", "tpx", "md", "mpx", "wc", "h1", "alt", "il", "el", "seo", "perf", "geo", "st", "jld", "raw"],
-                            params,
-                        )
-                    ),
-                )
-                row = res.fetchone()
-                return int(row[0]) if row else 1
+                with self._sa_engine.begin() as conn:
+                    res = conn.execute(
+                        text(
+                            """
+                            INSERT INTO url_audits (
+                                url, audited_at, status_code, title, title_px, meta_desc, meta_px,
+                                word_count, h1_count, missing_alt_count, internal_links, external_links,
+                                seo_score, performance_score, geo_score, schema_types, generated_jsonld, raw_audit_json
+                            ) VALUES (
+                                :u, :at, :sc, :t, :tpx, :md, :mpx, :wc, :h1, :alt, :il, :el,
+                                :seo, :perf, :geo, :st, :jld, :raw
+                            ) RETURNING id
+                            """
+                        ),
+                        dict(
+                            zip(
+                                ["u", "at", "sc", "t", "tpx", "md", "mpx", "wc", "h1", "alt", "il", "el", "seo", "perf", "geo", "st", "jld", "raw"],
+                                params,
+                            )
+                        ),
+                    )
+                    row = res.fetchone()
+                    return int(row[0]) if row else 1
+            except Exception as exc:
+                self.last_error = f"save_audit fallback: {exc}"
 
         with self._get_sqlite_conn() as conn:
             cur = conn.execute(
@@ -203,50 +237,95 @@ class StorageManager:
             return int(cur.lastrowid or 1)
 
     def get_recent_audits(self, limit: int = 25) -> pd.DataFrame:
-        """Return recent URL audits as a clean pandas DataFrame."""
-        query = f"""
-            SELECT id AS "ID", url AS "URL", audited_at AS "Audited At",
-                   status_code AS "HTTP", word_count AS "Words", title_px AS "Title (px)",
-                   h1_count AS "H1 Count", missing_alt_count AS "Missing Alts",
-                   seo_score AS "Tech SEO Score", performance_score AS "CWV Speed Score",
-                   geo_score AS "GEO Score"
+        """Return recent URL audits as a clean pandas DataFrame (no `%` signs in SQL)."""
+        sql_str = """
+            SELECT id, url, audited_at, status_code, word_count, title_px,
+                   h1_count, missing_alt_count, seo_score, performance_score, geo_score
             FROM url_audits
             ORDER BY id DESC
-            LIMIT {int(limit)}
+            LIMIT :lim
         """
+        rows_list: List[Dict[str, Any]] = []
+
         if self._use_postgres and self._sa_engine is not None:
-            return pd.read_sql(query, self._sa_engine)
-        with self._get_sqlite_conn() as conn:
-            return pd.read_sql_query(query, conn)
+            try:
+                from sqlalchemy import text
+
+                with self._sa_engine.connect() as conn:
+                    res = conn.execute(text(sql_str), {"lim": int(limit)})
+                    rows_list = [dict(r._mapping) for r in res.fetchall()]
+            except Exception as exc:
+                self.last_error = f"get_recent_audits fallback: {exc}"
+
+        if not rows_list and not self._use_postgres:
+            with self._get_sqlite_conn() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT id, url, audited_at, status_code, word_count, title_px,
+                           h1_count, missing_alt_count, seo_score, performance_score, geo_score
+                    FROM url_audits
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+                rows_list = [dict(r) for r in cur.fetchall()]
+
+        formatted = [
+            {
+                "ID": r.get("id"),
+                "URL": r.get("url"),
+                "Audited At": r.get("audited_at"),
+                "HTTP": r.get("status_code"),
+                "Words": r.get("word_count"),
+                "Title (px)": r.get("title_px"),
+                "H1 Count": r.get("h1_count"),
+                "Missing Alts": r.get("missing_alt_count"),
+                "Tech SEO Score": round(float(r.get("seo_score", 0.0) or 0.0), 1),
+                "CWV Speed Score": round(float(r.get("performance_score", 0.0) or 0.0), 1),
+                "GEO Score": round(float(r.get("geo_score", 0.0) or 0.0), 1),
+            }
+            for r in rows_list
+        ]
+        return pd.DataFrame(
+            formatted,
+            columns=[
+                "ID", "URL", "Audited At", "HTTP", "Words", "Title (px)",
+                "H1 Count", "Missing Alts", "Tech SEO Score", "CWV Speed Score", "GEO Score",
+            ],
+        )
 
     def save_keywords(self, seed: str, kw_rows: List[Dict[str, Any]]) -> int:
         """Persist a batch of enriched keyword rows."""
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if self._use_postgres and self._sa_engine is not None:
-            from sqlalchemy import text
+            try:
+                from sqlalchemy import text
 
-            with self._sa_engine.begin() as conn:
-                for item in kw_rows:
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO keyword_clusters (
-                                seed_keyword, keyword, modifier_type, search_intent,
-                                trend_score, opportunity_score, created_at
-                            ) VALUES (:s, :k, :m, :i, :t, :o, :c)
-                            """
-                        ),
-                        {
-                            "s": seed,
-                            "k": str(item.get("keyword", "")),
-                            "m": str(item.get("modifier_type", "base")),
-                            "i": str(item.get("search_intent", "Informational")),
-                            "t": float(item.get("trend_score", 50.0) or 50.0),
-                            "o": float(item.get("opportunity_score", 50.0) or 50.0),
-                            "c": now_iso,
-                        },
-                    )
-            return len(kw_rows)
+                with self._sa_engine.begin() as conn:
+                    for item in kw_rows:
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO keyword_clusters (
+                                    seed_keyword, keyword, modifier_type, search_intent,
+                                    trend_score, opportunity_score, created_at
+                                ) VALUES (:s, :k, :m, :i, :t, :o, :c)
+                                """
+                            ),
+                            {
+                                "s": seed,
+                                "k": str(item.get("keyword", "")),
+                                "m": str(item.get("modifier_type", "base")),
+                                "i": str(item.get("search_intent", "Informational")),
+                                "t": float(item.get("trend_score", 50.0) or 50.0),
+                                "o": float(item.get("opportunity_score", 50.0) or 50.0),
+                                "c": now_iso,
+                            },
+                        )
+                return len(kw_rows)
+            except Exception as exc:
+                self.last_error = f"save_keywords fallback: {exc}"
 
         with self._get_sqlite_conn() as conn:
             conn.executemany(
@@ -284,33 +363,36 @@ class StorageManager:
         """Log a new SEO/GEO page optimization experiment."""
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._use_postgres and self._sa_engine is not None:
-            from sqlalchemy import text
+            try:
+                from sqlalchemy import text
 
-            with self._sa_engine.begin() as conn:
-                res = conn.execute(
-                    text(
-                        """
-                        INSERT INTO seo_experiments (
-                            url, target_keyword, hypothesis, changes_made,
-                            baseline_position, baseline_ctr, current_position, current_ctr, status, created_at
-                        ) VALUES (:u, :k, :h, :c, :bp, :bc, :cp, :cc, 'Active', :dt)
-                        RETURNING id
-                        """
-                    ),
-                    {
-                        "u": url,
-                        "k": target_keyword,
-                        "h": hypothesis,
-                        "c": changes_made,
-                        "bp": baseline_position,
-                        "bc": baseline_ctr,
-                        "cp": baseline_position,
-                        "cc": baseline_ctr,
-                        "dt": now_iso,
-                    },
-                )
-                row = res.fetchone()
-                return int(row[0]) if row else 1
+                with self._sa_engine.begin() as conn:
+                    res = conn.execute(
+                        text(
+                            """
+                            INSERT INTO seo_experiments (
+                                url, target_keyword, hypothesis, changes_made,
+                                baseline_position, baseline_ctr, current_position, current_ctr, status, created_at
+                            ) VALUES (:u, :k, :h, :c, :bp, :bc, :cp, :cc, 'Active', :dt)
+                            RETURNING id
+                            """
+                        ),
+                        {
+                            "u": url,
+                            "k": target_keyword,
+                            "h": hypothesis,
+                            "c": changes_made,
+                            "bp": float(baseline_position),
+                            "bc": float(baseline_ctr),
+                            "cp": float(baseline_position),
+                            "cc": float(baseline_ctr),
+                            "dt": now_iso,
+                        },
+                    )
+                    row = res.fetchone()
+                    return int(row[0]) if row else 1
+            except Exception as exc:
+                self.last_error = f"log_experiment fallback: {exc}"
 
         with self._get_sqlite_conn() as conn:
             cur = conn.execute(
@@ -325,10 +407,10 @@ class StorageManager:
                     target_keyword,
                     hypothesis,
                     changes_made,
-                    baseline_position,
-                    baseline_ctr,
-                    baseline_position,
-                    baseline_ctr,
+                    float(baseline_position),
+                    float(baseline_ctr),
+                    float(baseline_position),
+                    float(baseline_ctr),
                     now_iso,
                 ),
             )
@@ -336,22 +418,53 @@ class StorageManager:
             return int(cur.lastrowid or 1)
 
     def get_experiments(self) -> pd.DataFrame:
-        """Fetch all logged SEO experiments."""
-        query = """
-            SELECT id AS "ID", created_at AS "Date", url AS "URL",
-                   target_keyword AS "Keyword", hypothesis AS "Hypothesis",
-                   changes_made AS "Changes Made", baseline_position AS "Base Pos",
-                   ROUND(baseline_ctr * 100.0, 2) AS "Base CTR (%)",
-                   current_position AS "Curr Pos",
-                   ROUND(current_ctr * 100.0, 2) AS "Curr CTR (%)",
-                   status AS "Status"
+        """Fetch all logged SEO experiments safely (avoids `%` in SQL and Postgres ROUND(real, int) errors)."""
+        sql_str = """
+            SELECT id, created_at, url, target_keyword, hypothesis, changes_made,
+                   baseline_position, baseline_ctr, current_position, current_ctr, status
             FROM seo_experiments
             ORDER BY id DESC
         """
+        rows_list: List[Dict[str, Any]] = []
+
         if self._use_postgres and self._sa_engine is not None:
-            return pd.read_sql(query, self._sa_engine)
-        with self._get_sqlite_conn() as conn:
-            return pd.read_sql_query(query, conn)
+            try:
+                from sqlalchemy import text
+
+                with self._sa_engine.connect() as conn:
+                    res = conn.execute(text(sql_str))
+                    rows_list = [dict(r._mapping) for r in res.fetchall()]
+            except Exception as exc:
+                self.last_error = f"get_experiments fallback: {exc}"
+
+        if not rows_list and not self._use_postgres:
+            with self._get_sqlite_conn() as conn:
+                cur = conn.execute(sql_str)
+                rows_list = [dict(r) for r in cur.fetchall()]
+
+        formatted = [
+            {
+                "ID": r.get("id"),
+                "Date": r.get("created_at"),
+                "URL": r.get("url"),
+                "Keyword": r.get("target_keyword"),
+                "Hypothesis": r.get("hypothesis"),
+                "Changes Made": r.get("changes_made"),
+                "Base Pos": round(float(r.get("baseline_position", 0.0) or 0.0), 1),
+                "Base CTR (%)": round(float(r.get("baseline_ctr", 0.0) or 0.0) * 100.0, 2),
+                "Curr Pos": round(float(r.get("current_position", 0.0) or 0.0), 1),
+                "Curr CTR (%)": round(float(r.get("current_ctr", 0.0) or 0.0) * 100.0, 2),
+                "Status": r.get("status", "Active"),
+            }
+            for r in rows_list
+        ]
+        return pd.DataFrame(
+            formatted,
+            columns=[
+                "ID", "Date", "URL", "Keyword", "Hypothesis", "Changes Made",
+                "Base Pos", "Base CTR (%)", "Curr Pos", "Curr CTR (%)", "Status",
+            ],
+        )
 
     def export_dataframe_to_gsheet(
         self,
